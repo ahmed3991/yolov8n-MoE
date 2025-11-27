@@ -560,8 +560,8 @@ def validate_one_epoch(model, dataloader, device, num_classes, class_names, epoc
                     # batch['cls'] is (N, 1) class index
                     # batch['bboxes'] is (N, 4) normalized bboxes
                     idx = batch['batch_idx'] == i
-                    cls = batch['cls'][idx].squeeze(-1)
-                    bbox = batch['bboxes'][idx]
+                    cls = batch['cls'][idx].squeeze(-1).to(device)
+                    bbox = batch['bboxes'][idx].to(device)
                     
                     # Convert normalized target bboxes to pixel coordinates
                     h, w = batch['img'].shape[2:]
@@ -571,7 +571,7 @@ def validate_one_epoch(model, dataloader, device, num_classes, class_names, epoc
                     if len(pred) == 0:
                         if len(cls) > 0:
                             # No detections, but ground truth exists -> all FN
-                            stats.append((torch.zeros(0, 10, dtype=torch.bool), torch.Tensor(), torch.Tensor(), cls))
+                            stats.append((torch.zeros(0, 10, dtype=torch.bool), torch.Tensor(), torch.Tensor(), cls.cpu()))
                         continue
                     
                     # Predictions
