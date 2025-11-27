@@ -149,7 +149,14 @@ class MoE_Bottleneck(nn.Module):
             b_indices = selected_indices // (H * W)
             
             expert_input = x_in[b_indices, :, h_indices, w_indices].reshape(-1, C, 1, 1)
-            expert_output = expert(expert_input).squeeze(-1).squeeze(-1)
+            
+            # Handle single-sample batch for BatchNorm
+            if expert_input.size(0) == 1 and self.training:
+                # Duplicate input to satisfy BatchNorm requirement (>1 sample)
+                expert_output = expert(expert_input.repeat(2, 1, 1, 1)).squeeze(-1).squeeze(-1)
+                expert_output = expert_output[:1]  # Take only the first sample
+            else:
+                expert_output = expert(expert_input).squeeze(-1).squeeze(-1)
 
             expert_weight_idx = (top_k_indices[selected_indices] == i).nonzero(as_tuple=True)[1]
             expert_weights = top_k_weights[selected_indices, expert_weight_idx]
@@ -229,6 +236,13 @@ class YOLOv8n_MoE_C2f(nn.Module):
         self.h_21 = C2f_MoE(C4 + C5, C5, n=N3, shortcut=False)
 
         self.h_22 = Detect(nc=self.nc, ch=[C3, C4, C5])
+        
+        # Initialize strides
+        self.stride = torch.tensor([8., 16., 32.])  # Default YOLOv8 strides
+        self.h_22.stride = self.stride
+        
+        # Init weights (optional but good practice)
+        self.h_22.bias_init()
 
     def forward(self, x):
         cache = []
