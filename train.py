@@ -1,5 +1,15 @@
 # -*- coding: utf-8 -*-
-"""YOLOv8n-MoE Training Script with Custom Training Loop"""
+"""YOLOv8n-MoE Training Script with Custom Training Loop
+
+NOTE: This script currently trains a baseline YOLOv8n model as a fallback.
+For proper MoE training with FIXED metrics calculation (no doubled precision/recall),
+use train_moe_custom.py instead, which includes:
+- Single-pass forward computation to prevent doubled metrics
+- Load balancing loss for expert utilization
+- Proper expert usage tracking
+
+See METRICS_FIX.md for more details.
+"""
 
 import torch
 import torch.nn as nn
