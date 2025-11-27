@@ -487,15 +487,16 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, num_epochs, los
 
 
 def validate_one_epoch(model, dataloader, device, num_classes, class_names, epoch, num_epochs):
-    """Validate model and compute per-class metrics."""
+    """Validate model and compute per-class metrics using proper NMS and IoU."""
     model.eval()
     
-    # Initialize counters for metrics
-    total_tp = 0  # True positives
-    total_fp = 0  # False positives
-    total_fn = 0  # False negatives
-    total_gt = 0  # Ground truth objects
+    # Initialize metrics
+    stats = []  # List of (correct, conf, cls, cls_gt)
     seen = 0
+    
+    # NMS parameters
+    conf_thres = 0.001  # Low confidence threshold for validation
+    iou_thres = 0.6     # NMS IoU threshold
     
     pbar = tqdm(dataloader, desc=f"Validating")
     
@@ -508,102 +509,147 @@ def validate_one_epoch(model, dataloader, device, num_classes, class_names, epoc
                 seen += batch_size
                 
                 # Forward pass
-                predictions = model(batch['img'])
+                preds = model(batch['img'])
                 
-                # Get predictions - Detect head outputs list of tensors
-                # Each tensor is (batch, num_anchors, 4+num_classes)
-                pred = predictions[0] if isinstance(predictions, (list, tuple)) else predictions
+                # Handle list output (from Detect head)
+                if isinstance(preds, (list, tuple)):
+                    preds = preds[0]
                 
-                # Process targets
-                targets = batch.get('bboxes', torch.zeros(0, 4, device=device))
-                batch_idx_tensor = batch.get('batch_idx', torch.zeros(len(targets), device=device))
-                cls = batch.get('cls', torch.zeros(len(targets), 1, device=device))
+                # Apply NMS
+                # preds: (batch, num_anchors, 4 + num_classes)
+                # output: list of (num_dets, 6) [x1, y1, x2, y2, conf, cls]
+                preds = ops.non_max_suppression(
+                    preds,
+                    conf_thres=conf_thres,
+                    iou_thres=iou_thres,
+                    multi_label=True,
+                    agnostic=False,
+                    max_det=300
+                )
                 
-                # Count ground truth objects
-                total_gt += len(targets)
-                
-                # Simple NMS alternative: for each image, count high-confidence predictions
-                if pred.dim() == 3:  # (batch, anchors, features)
-                    for img_idx in range(batch_size):
-                        # Get predictions for this image
-                        img_pred = pred[img_idx]  # (anchors, features)
+                # Process batch
+                for i, pred in enumerate(preds):
+                    # Get target for this image
+                    # batch['batch_idx'] is (N, ) index of image in batch
+                    # batch['cls'] is (N, 1) class index
+                    # batch['bboxes'] is (N, 4) normalized bboxes
+                    idx = batch['batch_idx'] == i
+                    cls = batch['cls'][idx].squeeze(-1)
+                    bbox = batch['bboxes'][idx]
+                    
+                    # Convert normalized target bboxes to pixel coordinates
+                    h, w = batch['img'].shape[2:]
+                    bbox = ops.xywhn2xyxy(bbox, w=w, h=h)
+                    
+                    # Metrics
+                    if len(pred) == 0:
+                        if len(cls) > 0:
+                            # No detections, but ground truth exists -> all FN
+                            stats.append((torch.zeros(0, 10, dtype=torch.bool), torch.Tensor(), torch.Tensor(), cls))
+                        continue
+                    
+                    # Predictions
+                    pred_conf = pred[:, 4]
+                    pred_cls = pred[:, 5]
+                    pred_box = pred[:, 0:4]
+                    
+                    # Evaluate
+                    if len(cls) > 0:
+                        # Match predictions to targets
+                        correct = ops.process_batch(
+                            detections=pred,
+                            labels=torch.cat((cls.unsqueeze(1), bbox), 1),
+                            iou_thresholds=torch.linspace(0.5, 0.95, 10, device=device)
+                        )
+                    else:
+                        correct = torch.zeros(len(pred), 10, dtype=torch.bool)
                         
-                        # Extract objectness/class scores (assuming features = 4 bbox + num_classes)
-                        # Features format: [x, y, w, h, class_scores...]
-                        if img_pred.shape[1] > 4:
-                            # Get max class score for each anchor
-                            class_scores = img_pred[:, 4:]
-                            max_scores, pred_classes = class_scores.max(dim=1)
-                            
-                            # Apply confidence threshold
-                            conf_mask = max_scores > 0.25
-                            confident_preds = conf_mask.sum().item()
-                            
-                            # Get ground truth count for this image
-                            gt_mask = batch_idx_tensor == img_idx
-                            num_gt = gt_mask.sum().item()
-                            
-                            # Simple matching: if we have predictions and GT, some are TP
-                            if confident_preds > 0 and num_gt > 0:
-                                # Assume some predictions match (rough heuristic)
-                                tp = min(confident_preds, num_gt)
-                                fp = max(0, confident_preds - num_gt)
-                                fn = max(0, num_gt - confident_preds)
-                            elif confident_preds > 0 and num_gt == 0:
-                                # All predictions are false positives
-                                tp = 0
-                                fp = confident_preds
-                                fn = 0
-                            elif confident_preds == 0 and num_gt > 0:
-                                # All GT are false negatives
-                                tp = 0
-                                fp = 0
-                                fn = num_gt
-                            else:
-                                tp = fp = fn = 0
-                            
-                            total_tp += tp
-                            total_fp += fp
-                            total_fn += fn
-                            
+                    stats.append((correct.cpu(), pred_conf.cpu(), pred_cls.cpu(), cls.cpu()))
+            
             except Exception as e:
-                # Skip corrupt batches
+                # print(f"Validation error: {e}")
                 continue
     
-    # Calculate metrics
+    # Compute metrics
     try:
-        if total_tp + total_fp > 0:
-            precision = total_tp / (total_tp + total_fp)
-        else:
-            precision = 0.0
+        stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
         
-        if total_tp + total_fn > 0:
-            recall = total_tp / (total_tp + total_fn)
-        else:
-            recall = 0.0
-        
-        if precision + recall > 0:
-            f1 = 2 * (precision * recall) / (precision + recall)
-            # Use F1 score as proxy for mAP
-            mAP50 = f1 * 0.9  # Slightly lower than F1
-            mAP50_95 = f1 * 0.7  # More conservative
-        else:
-            f1 = mAP50 = mAP50_95 = 0.0
-        
-        metrics_dict = {
-            'precision': precision,
-            'recall': recall,
-            'mAP50': mAP50,
-            'mAP50-95': mAP50_95,
-        }
+        if len(stats) and stats[0].any():
+            tp, conf, pred_cls, target_cls = stats
             
+            # Sort by confidence
+            i = np.argsort(-conf)
+            tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
+            
+            # Unique classes
+            unique_classes = np.unique(target_cls)
+            
+            ap50 = []
+            ap50_95 = []
+            p_list = []
+            r_list = []
+            
+            for c in unique_classes:
+                i = pred_cls == c
+                n_l = (target_cls == c).sum()  # number of labels
+                n_p = i.sum()  # number of predictions
+                
+                if n_p == 0 or n_l == 0:
+                    continue
+                
+                # Accumulate FPs and TPs
+                fpc = (1 - tp[i]).cumsum(0)
+                tpc = (tp[i]).cumsum(0)
+                
+                # Recall
+                recall = tpc / (n_l + 1e-16)
+                r = recall[:, 0]  # @0.5 IoU
+                
+                # Precision
+                precision = tpc / (tpc + fpc)
+                p = precision[:, 0]  # @0.5 IoU
+                
+                # AP from recall-precision curve
+                # Simple integration
+                mrec = np.concatenate(([0.0], r, [1.0]))
+                mpre = np.concatenate(([1.0], p, [0.0]))
+                
+                # Compute the precision envelope
+                for j in range(mpre.shape[0] - 1, 0, -1):
+                    mpre[j - 1] = np.maximum(mpre[j - 1], mpre[j])
+                    
+                # Integrate area under curve
+                i_idx = np.where(mrec[1:] != mrec[:-1])[0]  # points where x axis (recall) changes
+                ap = np.sum((mrec[i_idx + 1] - mrec[i_idx]) * mpre[i_idx + 1])
+                ap50.append(ap)
+                
+                # Approximate mAP50-95
+                mean_iou_match = tp[i].mean(axis=1).sum() / n_l
+                ap50_95.append(mean_iou_match) 
+                
+                p_list.append(np.mean(p))
+                r_list.append(np.mean(r))
+                
+            metrics_dict = {
+                'precision': np.mean(p_list) if p_list else 0.0,
+                'recall': np.mean(r_list) if r_list else 0.0,
+                'mAP50': np.mean(ap50) if ap50 else 0.0,
+                'mAP50-95': np.mean(ap50_95) if ap50_95 else 0.0,
+            }
+        else:
+            metrics_dict = {
+                'precision': 0.0,
+                'recall': 0.0,
+                'mAP50': 0.0,
+                'mAP50-95': 0.0,
+            }
     except Exception as e:
-        print(f"\n⚠️  Warning: Metrics calculation failed: {e}")
+        print(f"Metrics calculation error: {e}")
         metrics_dict = {'precision': 0.0, 'recall': 0.0, 'mAP50': 0.0, 'mAP50-95': 0.0}
     
     # Print overall metrics
     print(f"                 {'Class':<22} {'Images':<11} {'Instances':<14} {'Box(P':<15}{'R':<11}{'mAP50':<11}mAP50-95)")
-    print(f"                 {'all':<22} {seen:<11} {total_gt:<14} {metrics_dict['precision']:<15.3f}{metrics_dict['recall']:<11.3f}{metrics_dict['mAP50']:<11.3f}{metrics_dict['mAP50-95']:.4f}")
+    print(f"                 {'all':<22} {seen:<11} {len(stats[3]) if len(stats) > 3 else 0:<14} {metrics_dict['precision']:<15.3f}{metrics_dict['recall']:<11.3f}{metrics_dict['mAP50']:<11.3f}{metrics_dict['mAP50-95']:.4f}")
     
     return metrics_dict
 
