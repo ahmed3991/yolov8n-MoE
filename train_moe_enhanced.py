@@ -44,8 +44,34 @@ from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils.loss import v8DetectionLoss
 from ultralytics.utils import ops
 from ultralytics.cfg import get_cfg, DEFAULT_CFG
+from ultralytics.nn.autobackend import non_max_suppression  # Fixed import
 from torch.nn import Upsample
 import math
+
+def process_batch(detections, labels, iou_thresholds):
+    """
+    Return correct predictions matrix. Both sets of boxes are in (x1, y1, x2, y2) format.
+    Arguments:
+        detections (Tensor): (N, 6), [x1, y1, x2, y2, conf, class]
+        labels (Tensor): (M, 5), [class, x1, y1, x2, y2]
+        iou_thresholds (Tensor): (10, )
+    Returns:
+        correct (Tensor): (N, 10), bool
+    """
+    correct = torch.zeros(detections.shape[0], iou_thresholds.shape[0], dtype=torch.bool, device=iou_thresholds.device)
+    iou = box_iou(labels[:, 1:], detections[:, :4])
+    x = torch.where((iou >= iou_thresholds[0]) & (labels[:, 0:1] == detections[:, 5]))  # IoU > 0.5 and classes match
+    if x[0].shape[0]:
+        matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
+        if x[0].shape[0] > 1:
+            matches = matches[matches[:, 2].argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+            matches = matches[matches[:, 2].argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+        matches = torch.from_numpy(matches).to(iou_thresholds.device)
+        correct[matches[:, 1].long()] = matches[:, 2:3] >= iou_thresholds
+    return correct
+
 
 # Local imports
 from utils.metrics_moe import (
@@ -518,7 +544,7 @@ def validate_one_epoch(model, dataloader, device, num_classes, class_names, epoc
                 # Apply NMS
                 # preds: (batch, num_anchors, 4 + num_classes)
                 # output: list of (num_dets, 6) [x1, y1, x2, y2, conf, cls]
-                preds = ops.non_max_suppression(
+                preds = non_max_suppression(
                     preds,
                     conf_thres=conf_thres,
                     iou_thres=iou_thres,
@@ -556,7 +582,7 @@ def validate_one_epoch(model, dataloader, device, num_classes, class_names, epoc
                     # Evaluate
                     if len(cls) > 0:
                         # Match predictions to targets
-                        correct = ops.process_batch(
+                        correct = process_batch(
                             detections=pred,
                             labels=torch.cat((cls.unsqueeze(1), bbox), 1),
                             iou_thresholds=torch.linspace(0.5, 0.95, 10, device=device)
@@ -567,7 +593,7 @@ def validate_one_epoch(model, dataloader, device, num_classes, class_names, epoc
                     stats.append((correct.cpu(), pred_conf.cpu(), pred_cls.cpu(), cls.cpu()))
             
             except Exception as e:
-                # print(f"Validation error: {e}")
+                print(f"Validation error: {e}")
                 continue
     
     # Compute metrics
