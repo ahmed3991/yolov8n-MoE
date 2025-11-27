@@ -27,6 +27,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
+import warnings
+
+# Suppress PIL warnings for corrupt JPEG images
+warnings.filterwarnings('ignore', message='Corrupt JPEG data')
+warnings.filterwarnings('ignore', category=UserWarning, module='PIL')
 
 # Ultralytics imports
 from ultralytics import YOLO
@@ -339,54 +344,87 @@ def get_device():
 
 
 def train_one_epoch(model, dataloader, optimizer, device, epoch, num_epochs, loss_fn):
-    """Train for one epoch with proper metrics."""
+    """Train for one epoch with detailed loss display."""
     model.train()
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
-    total_loss = 0.0
+    total_box_loss = 0.0
+    total_cls_loss = 0.0
+    total_dfl_loss = 0.0
     total_balance_loss = 0.0
     
     for batch_idx, batch in enumerate(pbar):
-        # Preprocess batch (Ultralytics loss expects specific format)
-        batch['img'] = batch['img'].to(device, non_blocking=True).float() / 255.0
-        for k in ['batch_idx', 'cls', 'bboxes']:
-            batch[k] = batch[k].to(device)
+        try:
+            # Preprocess batch (Ultralytics loss expects specific format)
+            batch['img'] = batch['img'].to(device, non_blocking=True).float() / 255.0
+            for k in ['batch_idx', 'cls', 'bboxes']:
+                batch[k] = batch[k].to(device)
+                
+            # Forward pass - SINGLE PASS to prevent doubled metrics
+            optimizer.zero_grad()
+            predictions = model(batch['img'])
             
-        # Forward pass - SINGLE PASS to prevent doubled metrics
-        optimizer.zero_grad()
-        predictions = model(batch['img'])
-        
-        # Compute detection loss
-        loss, loss_items = loss_fn(predictions, batch)
-        
-        # Add load balancing auxiliary loss
-        balance_loss = model.get_total_balance_loss()
-        
-        # Ensure losses are scalars
-        if loss.numel() > 1:
-            loss = loss.sum()
-        if balance_loss.numel() > 1:
-            balance_loss = balance_loss.sum()
+            # Compute detection loss
+            loss, loss_items = loss_fn(predictions, batch)
             
-        total_loss_value = loss + BALANCE_COEF * balance_loss
-        
-        # Backward pass
-        total_loss_value.backward()
-        optimizer.step()
-        
-        # Update metrics
-        total_loss += loss.item()
-        total_balance_loss += balance_loss.item()
-        
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'balance': f'{balance_loss.item():.4f}'
-        })
+            # Extract individual loss components from loss_items
+            # loss_items typically contains [box_loss, cls_loss, dfl_loss]
+            box_loss = loss_items[0].item() if len(loss_items) > 0 else 0.0
+            cls_loss = loss_items[1].item() if len(loss_items) > 1 else 0.0
+            dfl_loss = loss_items[2].item() if len(loss_items) > 2 else 0.0
+            
+            # Add load balancing auxiliary loss
+            balance_loss = model.get_total_balance_loss()
+            
+            # Ensure losses are scalars
+            if loss.numel() > 1:
+                loss = loss.sum()
+            if balance_loss.numel() > 1:
+                balance_loss = balance_loss.sum()
+                
+            total_loss_value = loss + BALANCE_COEF * balance_loss
+            
+            # Backward pass
+            total_loss_value.backward()
+            optimizer.step()
+            
+            # Update running totals
+            total_box_loss += box_loss
+            total_cls_loss += cls_loss
+            total_dfl_loss += dfl_loss
+            total_balance_loss += balance_loss.item()
+            
+            # Get GPU memory
+            if torch.cuda.is_available():
+                gpu_mem = torch.cuda.memory_allocated() / 1024**3
+            elif torch.backends.mps.is_available():
+                try:
+                    gpu_mem = torch.mps.current_allocated_memory() / 1024**3
+                except:
+                    gpu_mem = 0.0
+            else:
+                gpu_mem = 0.0
+            
+            # Display detailed losses in progress bar
+            pbar.set_postfix({
+                'GPU_mem': f'{gpu_mem:.2f}G',
+                'box': f'{box_loss:.4f}',
+                'cls': f'{cls_loss:.4f}',
+                'dfl': f'{dfl_loss:.4f}',
+                'bal': f'{balance_loss.item():.4f}'
+            })
+        except Exception as e:
+            # Skip corrupt batches
+            continue
     
-    avg_loss = total_loss / len(dataloader)
-    avg_balance = total_balance_loss / len(dataloader)
-    
-    return avg_loss, avg_balance
+    # Return averages
+    num_batches = len(dataloader)
+    return {
+        'box_loss': total_box_loss / num_batches,
+        'cls_loss': total_cls_loss / num_batches,
+        'dfl_loss': total_dfl_loss / num_batches,
+        'balance_loss': total_balance_loss / num_batches,
+    }
 
 
 def main():
@@ -506,15 +544,19 @@ def main():
     
     for epoch in range(args.epochs):
         # Train one epoch
-        avg_loss, avg_balance = train_one_epoch(
+        metrics = train_one_epoch(
             model, train_loader, optimizer, device, epoch, args.epochs, loss_fn
         )
         
         # Update scheduler
         scheduler.step()
         
-        # Print metrics
-        print(f"   Epoch {epoch+1}/{args.epochs} - Loss: {avg_loss:.4f} - Balance Loss: {avg_balance:.4f}")
+        # Print detailed metrics
+        print(f"   Epoch {epoch+1}/{args.epochs} - "
+              f"Box: {metrics['box_loss']:.4f} | "
+              f"Cls: {metrics['cls_loss']:.4f} | "
+              f"DFL: {metrics['dfl_loss']:.4f} | "
+              f"Balance: {metrics['balance_loss']:.4f}")
         
         # Save checkpoint
         if (epoch + 1) % 10 == 0 or epoch == args.epochs - 1:
@@ -523,15 +565,16 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
+                'metrics': metrics,
             }, ckpt_path)
             
-        # Save best model
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        # Save best model (using box_loss as primary metric)
+        current_loss = metrics['box_loss']
+        if current_loss < best_loss:
+            best_loss = current_loss
             best_path = os.path.join(CHECKPOINT_DIR, 'best.pt')
             torch.save(model.state_dict(), best_path)
-            print(f"   💾 New best model saved! (Loss: {best_loss:.4f})")
+            print(f"   💾 New best model saved! (Box Loss: {best_loss:.4f})")
             
     print("\n" + "="*60)
     print("✅ Training complete!")

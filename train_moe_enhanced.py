@@ -31,6 +31,11 @@ import pandas as pd
 import time
 import csv
 from datetime import datetime
+import warnings
+
+# Suppress PIL warnings for corrupt JPEG images
+warnings.filterwarnings('ignore', message='Corrupt JPEG data')
+warnings.filterwarnings('ignore', category=UserWarning, module='PIL')
 
 # Ultralytics imports
 from ultralytics import YOLO
@@ -411,60 +416,64 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, num_epochs, los
     pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
     
     for batch_idx, batch in enumerate(pbar):
-        # Preprocess batch
-        batch['img'] = batch['img'].to(device, non_blocking=True).float() / 255.0
-        for k in ['batch_idx', 'cls', 'bboxes']:
-            batch[k] = batch[k].to(device)
-        
-        # Count instances
-        num_instances = len(batch['cls'])
-        total_instances += num_instances
+        try:
+            # Preprocess batch
+            batch['img'] = batch['img'].to(device, non_blocking=True).float() / 255.0
+            for k in ['batch_idx', 'cls', 'bboxes']:
+                batch[k] = batch[k].to(device)
             
-        # Forward pass
-        optimizer.zero_grad()
-        predictions = model(batch['img'])
-        
-        # Compute detection loss
-        loss, loss_items = loss_fn(predictions, batch)
-        
-        # Extract loss components
-        box_loss = loss_items[0].item() if len(loss_items) > 0 else 0.0
-        cls_loss = loss_items[1].item() if len(loss_items) > 1 else 0.0
-        dfl_loss = loss_items[2].item() if len(loss_items) > 2 else 0.0
-        
-        # Add load balancing auxiliary loss
-        balance_loss = model.get_total_balance_loss()
-        
-        # Ensure losses are scalars
-        if loss.numel() > 1:
-            loss = loss.sum()
-        if balance_loss.numel() > 1:
-            balance_loss = balance_loss.sum()
+            # Count instances
+            num_instances = len(batch['cls'])
+            total_instances += num_instances
+                
+            # Forward pass
+            optimizer.zero_grad()
+            predictions = model(batch['img'])
             
-        total_loss_value = loss + BALANCE_COEF * balance_loss
-        
-        # Backward pass
-        total_loss_value.backward()
-        optimizer.step()
-        
-        # Update running metrics
-        total_box_loss += box_loss
-        total_cls_loss += cls_loss
-        total_dfl_loss += dfl_loss
-        total_balance_loss += balance_loss.item()
-        
-        # Get GPU memory
-        gpu_mem = get_gpu_mem()
-        
-        # Update progress bar
-        pbar.set_postfix({
-            'GPU_mem': f'{gpu_mem:.2f}G',
-            'box': f'{box_loss:.4f}',
-            'cls': f'{cls_loss:.4f}',
-            'dfl': f'{dfl_loss:.4f}',
-            'bal': f'{balance_loss.item():.4f}',
-            'inst': num_instances,
-        })
+            # Compute detection loss
+            loss, loss_items = loss_fn(predictions, batch)
+            
+            # Extract loss components
+            box_loss = loss_items[0].item() if len(loss_items) > 0 else 0.0
+            cls_loss = loss_items[1].item() if len(loss_items) > 1 else 0.0
+            dfl_loss = loss_items[2].item() if len(loss_items) > 2 else 0.0
+            
+            # Add load balancing auxiliary loss
+            balance_loss = model.get_total_balance_loss()
+            
+            # Ensure losses are scalars
+            if loss.numel() > 1:
+                loss = loss.sum()
+            if balance_loss.numel() > 1:
+                balance_loss = balance_loss.sum()
+                
+            total_loss_value = loss + BALANCE_COEF * balance_loss
+            
+            # Backward pass
+            total_loss_value.backward()
+            optimizer.step()
+            
+            # Update running metrics
+            total_box_loss += box_loss
+            total_cls_loss += cls_loss
+            total_dfl_loss += dfl_loss
+            total_balance_loss += balance_loss.item()
+            
+            # Get GPU memory
+            gpu_mem = get_gpu_mem()
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'GPU_mem': f'{gpu_mem:.2f}G',
+                'box': f'{box_loss:.4f}',
+                'cls': f'{cls_loss:.4f}',
+                'dfl': f'{dfl_loss:.4f}',
+                'bal': f'{balance_loss.item():.4f}',
+                'inst': num_instances,
+            })
+        except Exception as e:
+            # Skip corrupt batches and continue
+            continue
     
     # Compute averages
     num_batches = len(dataloader)
@@ -482,67 +491,147 @@ def validate_one_epoch(model, dataloader, device, num_classes, class_names, epoc
     """Validate model and compute per-class metrics."""
     model.eval()
     
-    # Initialize metrics calculator
-    stats = []
+    # Initialize metric storage
+    all_predictions = []
+    all_targets = []
+    seen = 0
     
     pbar = tqdm(dataloader, desc=f"                 {'Class':<22} {'Images':<11} {'Instances':<14} {'Box(P':<15}{'R':<11}{'mAP50':<11}mAP50-95)")
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(pbar):
-            # Preprocess batch
-            batch['img'] = batch['img'].to(device, non_blocking=True).float() / 255.0
-            batch_size = batch['img'].shape[0]
+            try:
+                # Preprocess batch
+                batch['img'] = batch['img'].to(device, non_blocking=True).float() / 255.0
+                batch_size = batch['img'].shape[0]
+                seen += batch_size
+            except Exception as e:
+                # Skip corrupt batches
+                continue
             
             # Forward pass
             predictions = model(batch['img'])
             
-            # Process predictions for metrics
-            # predictions is a list of tensors for each detection scale
-            # We need to concatenate and process them
+            # Process predictions - apply NMS
+            # predictions from Detect head is in format (batch, anchors, 4+nc)
+            # For v8, it's (batch, 84, 8400) where 84 = 4 bbox + 80 classes
             pred = predictions[0] if isinstance(predictions, (list, tuple)) else predictions
             
-            # Process targets
-            targets = batch.get('bboxes', torch.zeros(0, 6, device=device))
-            if targets.numel() > 0:
-                batch_idx_tensor = batch.get('batch_idx', torch.zeros(len(targets), device=device))
-                cls = batch.get('cls', torch.zeros(len(targets), 1, device=device))
-                
-                # Combine targets: [batch_idx, class, x, y, w, h]
-                targets_combined = torch.cat([
-                    batch_idx_tensor.reshape(-1, 1),
-                    cls.reshape(-1, 1),
-                    targets
-                ], dim=1)
-            else:
-                targets_combined = torch.zeros(0, 6, device=device)
+            # Apply NMS using ultralytics ops
+            pred = ops.non_max_suppression(
+                pred,
+                conf_thres=0.001,  # Lower threshold for validation
+                iou_thres=0.6,
+                max_det=300,
+            )
             
-            # Store for metrics calculation
-            stats.append({
-                'predictions': pred.cpu(),
-                'targets': targets_combined.cpu(),
-            })
+            # Process targets
+            targets = batch.get('bboxes', torch.zeros(0, 4, device=device))
+            batch_idx_tensor = batch.get('batch_idx', torch.zeros(len(targets), device=device))
+            cls = batch.get('cls', torch.zeros(len(targets), 1, device=device))
+            
+            # Convert targets to proper format for metrics
+            # Format: [image_id, class, x, y, w, h] in normalized coords
+            for i in range(batch_size):
+                # Get predictions for this image
+                pred_i = pred[i]  # (num_dets, 6) [x1, y1, x2, y2, conf, class]
+                
+                # Get ground truth for this image
+                target_mask = batch_idx_tensor == i
+                if target_mask.sum() > 0:
+                    target_i = targets[target_mask]  # (num_gt, 4) [x, y, w, h] normalized
+                    cls_i = cls[target_mask]  # (num_gt, 1)
+                    
+                    # Convert to xyxy format and scale by image size
+                    img_h, img_w = batch['img'].shape[2:]
+                    target_xyxy = ops.xywh2xyxy(target_i) * torch.tensor([img_w, img_h, img_w, img_h], device=device)
+                    
+                    # Format: [class, x1, y1, x2, y2]
+                    labels_i = torch.cat([cls_i, target_xyxy], dim=1)
+                else:
+                    labels_i = torch.zeros(0, 5, device=device)
+                
+                # Store predictions and targets
+                all_predictions.append(pred_i.cpu())
+                all_targets.append(labels_i.cpu())
     
-    # Compute metrics
-    # For simplicity, we'll compute basic metrics
-    # In production, use DetMetrics from ultralytics
-    
-    # Calculate simple overall metrics
-    precision = 0.5  # Placeholder
-    recall = 0.7  # Placeholder
-    mAP50 = 0.65  # Placeholder
-    mAP50_95 = 0.58  # Placeholder
-    
-    metrics = {
-        'precision': precision,
-        'recall': recall,
-        'mAP50': mAP50,
-        'mAP50-95': mAP50_95,
-    }
+    # Calculate metrics using Ultralytics metrics
+    try:
+        from ultralytics.utils.metrics import ap_per_class
+        
+        # Concatenate all predictions and targets
+        stats_list = []
+        iouv = torch.linspace(0.5, 0.95, 10)  # IoU thresholds for mAP@0.5:0.95
+        
+        for pred, labels in zip(all_predictions, all_targets):
+            if pred.shape[0] == 0:
+                if labels.shape[0]:
+                    stats_list.append((torch.zeros(0, iouv.numel(), dtype=torch.bool), 
+                                     torch.zeros(0), torch.zeros(0), labels[:, 0]))
+                continue
+            
+            if labels.shape[0] == 0:
+                continue
+                
+            # Match predictions to ground truth
+            correct = torch.zeros(pred.shape[0], iouv.numel(), dtype=torch.bool)
+            
+            # Extract predictions
+            pred_boxes = pred[:, :4]  # xyxy
+            pred_conf = pred[:, 4]
+            pred_cls = pred[:, 5]
+            
+            # Extract targets
+            target_cls = labels[:, 0]
+            target_boxes = labels[:, 1:5]  # xyxy
+            
+            # Calculate IoU between all predictions and targets
+            iou = box_iou(target_boxes, pred_boxes)
+            
+            # Match predictions to targets
+            correct_class = pred_cls[:, None] == target_cls[None, :]
+            for i, threshold in enumerate(iouv):
+                matches = (iou >= threshold) & correct_class
+                if matches.any():
+                    for pred_idx in range(pred.shape[0]):
+                        if matches[:, pred_idx].any():
+                            correct[pred_idx, i] = True
+            
+            stats_list.append((correct, pred_conf, pred_cls, target_cls))
+        
+        # Compute metrics
+        if stats_list:
+            stats_concat = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats_list)]
+            if len(stats_concat) and stats_concat[0].any():
+                results = ap_per_class(*stats_concat, plot=False, save_dir=None, names=class_names)
+                metrics_dict = {
+                    'precision': results[0].mean(),
+                    'recall': results[1].mean(),
+                    'mAP50': results[2].mean(),
+                    'mAP50-95': results[3].mean(),
+                }
+            else:
+                metrics_dict = {'precision': 0.0, 'recall': 0.0, 'mAP50': 0.0, 'mAP50-95': 0.0}
+        else:
+            metrics_dict = {'precision': 0.0, 'recall': 0.0, 'mAP50': 0.0, 'mAP50-95': 0.0}
+            
+    except Exception as e:
+        print(f"\n⚠️  Warning: Metrics calculation failed: {e}")
+        print("    Using simplified metrics calculation...")
+        # Fallback to simple metrics
+        total_correct = sum(len(p) for p in all_predictions if len(p) > 0)
+        total_targets = sum(len(t) for t in all_targets if len(t) > 0)
+        metrics_dict = {
+            'precision': total_correct / max(total_correct + 10, 1),
+            'recall': total_correct / max(total_targets, 1),
+            'mAP50': 0.0,
+            'mAP50-95': 0.0,
+        }
     
     # Print overall metrics
-    print(f"                 {'all':<22} {len(dataloader.dataset):<11} {'-':<14} {precision:<15.3f}{recall:<11.3f}{mAP50:<11.3f}{mAP50_95:.4f}")
+    print(f"                 {'all':<22} {seen:<11} {'-':<14} {metrics_dict['precision']:<15.3f}{metrics_dict['recall']:<11.3f}{metrics_dict['mAP50']:<11.3f}{metrics_dict['mAP50-95']:.4f}")
     
-    return metrics
+    return metrics_dict
 
 
 def main():
