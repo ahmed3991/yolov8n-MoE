@@ -1,0 +1,4 @@
+.venv
+runs
+yolo*.pt
+pet-dataset-yolo
