@@ -635,8 +635,7 @@ def validate_one_epoch(model, dataloader, device, num_classes, class_names, epoc
                 precision = tpc / (tpc + fpc)
                 p = precision[:, 0]  # @0.5 IoU
                 
-                # AP from recall-precision curve
-                # Simple integration
+                # AP@0.5 from recall-precision curve
                 mrec = np.concatenate(([0.0], r, [1.0]))
                 mpre = np.concatenate(([1.0], p, [0.0]))
                 
@@ -649,9 +648,25 @@ def validate_one_epoch(model, dataloader, device, num_classes, class_names, epoc
                 ap = np.sum((mrec[i_idx + 1] - mrec[i_idx]) * mpre[i_idx + 1])
                 ap50.append(ap)
                 
-                # Approximate mAP50-95
-                mean_iou_match = tp[i].mean(axis=1).sum() / n_l
-                ap50_95.append(mean_iou_match) 
+                # Compute mAP50-95: average of AP across IoU thresholds 0.5:0.95
+                aps = []
+                for iou_idx in range(10):  # 10 IoU thresholds from 0.5 to 0.95
+                    r_at_iou = recall[:, iou_idx]
+                    p_at_iou = precision[:, iou_idx]
+                    
+                    mrec_iou = np.concatenate(([0.0], r_at_iou, [1.0]))
+                    mpre_iou = np.concatenate(([1.0], p_at_iou, [0.0]))
+                    
+                    # Compute precision envelope
+                    for j in range(mpre_iou.shape[0] - 1, 0, -1):
+                        mpre_iou[j - 1] = np.maximum(mpre_iou[j - 1], mpre_iou[j])
+                    
+                    # Integrate
+                    i_idx_iou = np.where(mrec_iou[1:] != mrec_iou[:-1])[0]
+                    ap_at_iou = np.sum((mrec_iou[i_idx_iou + 1] - mrec_iou[i_idx_iou]) * mpre_iou[i_idx_iou + 1])
+                    aps.append(ap_at_iou)
+                
+                ap50_95.append(np.mean(aps))  # Average AP across all IoU thresholds
                 
                 p_list.append(np.mean(p))
                 r_list.append(np.mean(r))
